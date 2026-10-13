@@ -101,16 +101,20 @@ void defaultkey_precreate_dm_device() {
 static bool mount_via_fs_mgr(const char* mount_point, const char* blk_device, bool needs_encrypt) {
     // fs_mgr_do_mount runs fsck. Use setexeccon to run trusted
     // partitions in the fsck domain.
+    #ifndef RECOVERY_STORAGE
     if (setexeccon(android::vold::sFsckContext)) {
         PLOG(ERROR) << "Failed to setexeccon";
         return false;
     }
+    #endif
     auto mount_rc = fs_mgr_do_mount(&fstab_default, mount_point, blk_device,
                                     android::vold::cp_needsCheckpoint(), needs_encrypt);
+    #ifndef RECOVERY_STORAGE
     if (setexeccon(nullptr)) {
         PLOG(ERROR) << "Failed to clear setexeccon";
         return false;
     }
+    #endif
     if (mount_rc != 0) {
         LOG(ERROR) << "fs_mgr_do_mount failed with rc " << mount_rc;
         return false;
@@ -128,6 +132,9 @@ static bool read_key(const std::string& metadata_key_dir, const KeyGeneration& g
     std::string sKey;
     auto dir = metadata_key_dir + "/key";
     LOG(DEBUG) << "metadata_key_dir/key: " << dir;
+#ifdef RECOVERY_STORAGE
+    return retrieveKey(dir, kEmptyAuthentication, key);
+#else
     if (!MkdirsSync(dir, 0700)) return false;
     auto in_dsu = android::base::GetBoolProperty("ro.gsid.image_running", false);
     // !pathExists(dir) does not imply there's a factory reset when in DSU mode.
@@ -144,6 +151,7 @@ static bool read_key(const std::string& metadata_key_dir, const KeyGeneration& g
     }
     auto temp = metadata_key_dir + "/tmp";
     return retrieveOrGenerateKey(dir, temp, kEmptyAuthentication, gen, key);
+#endif
 }
 
 static bool get_number_of_sectors(const std::string& real_blkdev, uint64_t* nr_sec) {

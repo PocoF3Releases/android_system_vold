@@ -225,12 +225,14 @@ void DeferredCommitKeystoreKeys() {
 
 // Returns true if the Keystore key in |dir| has already been upgraded and is
 // pending being committed.  Assumes that key_upgrade_lock is held.
+#ifndef RECOVERY_STORAGE
 static bool IsKeyCommitPending(const std::string& dir) {
     for (const auto& dir_to_commit : key_dirs_to_commit) {
         if (IsSameFile(dir, dir_to_commit)) return true;
     }
     return false;
 }
+#endif
 
 // Schedules the upgraded Keystore key in |dir| to be committed later.  Assumes
 // that key_upgrade_lock is held and that a commit isn't already pending for the
@@ -276,6 +278,7 @@ bool RenameKeyDir(const std::string& old_name, const std::string& new_name) {
 // Deletes a leftover upgraded key, if present.  An upgraded key can be left
 // over if an update failed, or if we rebooted before committing the key in a
 // freak accident.  Either way, we can re-upgrade the key if we need to.
+#ifndef RECOVERY_STORAGE
 static void DeleteUpgradedKey(Keystore& keystore, const std::string& path) {
     if (pathExists(path)) {
         LOG(DEBUG) << "Deleting leftover upgraded key " << path;
@@ -293,6 +296,7 @@ static void DeleteUpgradedKey(Keystore& keystore, const std::string& path) {
         }
     }
 }
+#endif
 
 // Begins a Keystore operation using the key stored in |dir|.
 static KeystoreOperation BeginKeystoreOp(Keystore& keystore, const std::string& dir,
@@ -308,20 +312,31 @@ static KeystoreOperation BeginKeystoreOp(Keystore& keystore, const std::string& 
     std::lock_guard<std::mutex> lock(key_upgrade_lock);
 
     std::string blob;
+#ifdef RECOVERY_STORAGE
+    bool already_upgraded = pathExists(upgraded_blob_file);
+#else
     bool already_upgraded = IsKeyCommitPending(dir);
+#endif
     if (already_upgraded) {
         LOG(DEBUG)
                 << blob_file
                 << " was already upgraded and is waiting to be committed; using the upgraded blob";
         if (!readFileToString(upgraded_blob_file, &blob)) return KeystoreOperation();
     } else {
+#ifndef RECOVERY_STORAGE
         DeleteUpgradedKey(keystore, upgraded_blob_file);
+#endif
         if (!readFileToString(blob_file, &blob)) return KeystoreOperation();
     }
 
     auto opHandle = keystore.begin(blob, inParams, outParams);
     if (!opHandle) return opHandle;
 
+#ifdef RECOVERY_STORAGE
+    // Use the operation's transient upgraded blob without committing it or
+    // deleting either persistent key. Android owns persistent key upgrades.
+    return opHandle;
+#endif
     // If key blob wasn't upgraded, nothing left to do.
     if (!opHandle.getUpgradedBlob()) return opHandle;
 

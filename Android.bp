@@ -71,6 +71,7 @@ cc_defaults {
 
 cc_library_static {
     name: "libvold_binder",
+    recovery_available: true,
     defaults: ["vold_default_flags"],
 
     srcs: [
@@ -110,6 +111,10 @@ vintf_fragment {
 // Static library factored out to support testing
 cc_library_static {
     name: "libvold",
+    recovery_available: true,
+    target: {
+        recovery: { cflags: ["-DRECOVERY_STORAGE"] },
+    },
     defaults: [
         "vold_default_flags",
         "vold_default_libs",
@@ -291,5 +296,20 @@ aconfig_declarations {
 
 cc_aconfig_library {
     name: "vold_flags_c_lib",
+    recovery_available: true,
     aconfig_declarations: "vold_flags",
+}
+
+// The ROM recovery reuses Android's native storage stack. Only this variant
+// receives RECOVERY_STORAGE existing-key-only behavior.
+cc_binary {
+    name: "recovery-storage",
+    recovery: true,
+    defaults: ["vold_default_flags", "vold_default_libs", "keystore2_use_latest_aidl_ndk_shared"],
+    srcs: ["recovery/RecoveryStorage.cpp", "recovery/DefaultCredential.cpp"],
+    static_libs: ["libvold", "libsqlite_static_noicu"],
+    header_libs: ["libvold_headers"],
+    include_dirs: ["external/sqlite/dist"],
+    cflags: ["-DRECOVERY_STORAGE"],
+    required: ["keystore2_recovery", "hwservicemanager_recovery"],
 }

@@ -94,9 +94,11 @@ const std::string prepare_subdirs_path = "/system/bin/vold_prepare_subdirs";
 const std::string systemwide_volume_key_dir =
     std::string() + DATA_MNT_POINT + "/misc/vold/volume_keys";
 
+#ifndef RECOVERY_STORAGE
 const std::string data_data_dir = std::string() + DATA_MNT_POINT + "/data";
 const std::string data_user_0_dir = std::string() + DATA_MNT_POINT + "/user/0";
 const std::string media_obb_dir = std::string() + DATA_MNT_POINT + "/media/obb";
+#endif
 
 // The file encryption options to use on the /data filesystem
 EncryptionOptions s_data_options;
@@ -233,8 +235,10 @@ static bool read_and_fixate_user_ce_key(userid_t user_id,
         LOG(DEBUG) << "Trying user CE key " << ce_key_path;
         if (retrieveKey(ce_key_path, auth, ce_key)) {
             LOG(DEBUG) << "Successfully retrieved key";
+#ifndef RECOVERY_STORAGE
             s_deferred_fixations.erase(directory_path);
             fixate_user_ce_key(directory_path, ce_key_path, paths);
+#endif
             return true;
         }
     }
@@ -554,6 +558,11 @@ bool fscrypt_initialize_systemwide_keys() {
     if (!init_data_file_encryption_options()) return false;
 
     KeyBuffer device_key;
+#ifdef RECOVERY_STORAGE
+    // Recovery only loads existing keys; it never provisions or rotates them.
+    if (!retrieveKey(device_key_path, kEmptyAuthentication, &device_key)) return false;
+    return install_userdata_key(device_key, &s_device_policy);
+#else
     if (!retrieveOrGenerateKey(device_key_path, device_key_temp, kEmptyAuthentication,
                                userdataKeyGen(), &device_key))
         return false;
@@ -584,6 +593,7 @@ bool fscrypt_initialize_systemwide_keys() {
     LOG(INFO) << "Wrote per boot key reference to:" << per_boot_ref_filename;
 
     return true;
+#endif
 }
 
 static void remove_casefolding_from_folder(std::string const& folder, std::string const& leaf) {
@@ -596,6 +606,7 @@ static void remove_casefolding_from_folder(std::string const& folder, std::strin
             ->moveFolder(String16(original_folder.c_str()), String16(folder.c_str()));
 }
 
+#ifndef RECOVERY_STORAGE
 static bool prepare_special_dirs() {
     // Ensure that /data/data and its "alias" /data/user/0 exist, and create the
     // bind mount of /data/data onto /data/user/0.  This *should* happen in
@@ -651,11 +662,17 @@ static bool prepare_special_dirs() {
     }
     return true;
 }
+#endif
 
 bool fscrypt_init_user0_done;
 
 bool fscrypt_init_user0() {
     LOG(DEBUG) << "fscrypt_init_user0";
+#ifdef RECOVERY_STORAGE
+    if (!IsFbeEnabled() || !de_key_exists(0) || !ce_key_exists(0)) return false;
+    fscrypt_init_user0_done = load_all_de_keys();
+    return fscrypt_init_user0_done;
+#else
 
     if (IsFbeEnabled()) {
         if (!prepare_dir(user_key_dir, 0700, AID_ROOT, AID_ROOT)) return false;
@@ -687,6 +704,7 @@ bool fscrypt_init_user0() {
 
     fscrypt_init_user0_done = true;
     return true;
+#endif
 }
 
 // Creates the CE and DE keys for a new user.
