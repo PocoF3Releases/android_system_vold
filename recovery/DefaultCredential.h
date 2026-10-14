@@ -3,4 +3,5 @@
 #pragma once
 #include <cstdint>
 #include <vector>
-bool RecoveryDefaultCredentialSecret(std::vector<uint8_t>* secret);
+int RecoveryCredentialType();
+bool RecoveryCredentialSecret(const std::vector<uint8_t>& credential, std::vector<uint8_t>* secret);

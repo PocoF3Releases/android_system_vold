@@ -78,7 +78,11 @@ bool StartKeystore() {
 
 bool StopRecoveryCryptoServices() {
     bool success = true;
-    for (const char* service : {"keystore2-recovery", "recovery-keymaster", "recovery-qseecomd"}) {
+    for (const char* service :
+         {"keystore2-recovery", "recovery-gatekeeper", "recovery-keymaster", "recovery-qseecomd"}) {
+        if (std::string(service) == "recovery-gatekeeper" &&
+            GetProperty("init.svc.recovery-gatekeeper", "").empty())
+            continue;
         const bool stopped = SetProperty("ctl.stop", service);
         const bool exited = stopped && android::base::WaitForProperty(
             std::string("init.svc.") + service, "stopped", std::chrono::seconds(5));
@@ -121,6 +125,18 @@ bool SnapshotDatabase(const std::string& source, const std::string& directory, u
                                                             SELINUX_ANDROID_RESTORECON_RECURSE) == 0;
 }
 
+bool ReadCredential(std::vector<uint8_t>* credential) {
+    android::base::unique_fd fd(
+            open("/tmp/recovery-credential", O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+    if (fd < 0) return errno == ENOENT;
+    struct stat st{};
+    if (fstat(fd.get(), &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != AID_ROOT ||
+        (st.st_mode & 0077) != 0 || st.st_nlink != 1 || st.st_size < 1 || st.st_size > 64)
+        return false;
+    credential->resize(st.st_size);
+    return android::base::ReadFully(fd.get(), credential->data(), credential->size());
+}
+
 bool InitializeExistingKeys() {
     return fscrypt_initialize_systemwide_keys() && fscrypt_init_user0();
 }
@@ -143,6 +159,14 @@ bool MountExistingData() {
     auto entry = android::fs_mgr::GetEntryForMountPoint(&fstab_default, "/data");
     if (!entry || entry->metadata_key_dir.empty() ||
         access((entry->metadata_key_dir + "/key").c_str(), R_OK) != 0) return false;
+    android::fs_mgr::Fstab mounts;
+    if (!android::fs_mgr::ReadFstabFromFile("/proc/mounts", &mounts)) return false;
+    if (const auto mounted = android::fs_mgr::GetEntryForMountPoint(&mounts, "/data")) {
+        // A locked mount survives the first attempt. Reuse it for credential retries;
+        // never recreate its default-key mapping or remount it writable.
+        return mounted->fs_type == entry->fs_type && (mounted->flags & MS_RDONLY) &&
+               InitializeExistingKeys();
+    }
     return android::vold::fscrypt_mount_metadata_encrypted(entry->blk_device, "/data", false,
         false, entry->fs_type, false, {}, {}, 0) && InitializeExistingKeys();
 }
@@ -160,7 +184,10 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--unlock") {
         if (!InitializeExistingKeys()) return 1;
         std::vector<uint8_t> secret;
-        const bool derived = RecoveryDefaultCredentialSecret(&secret);
+        std::vector<uint8_t> credential;
+        const bool derived =
+                ReadCredential(&credential) && RecoveryCredentialSecret(credential, &secret);
+        OPENSSL_cleanse(credential.data(), credential.size());
         const bool unlocked = derived && fscrypt_unlock_ce_storage(0, secret);
         OPENSSL_cleanse(secret.data(), secret.size());
         return unlocked && IsStorageUnlocked() ? 0 : 1;
@@ -186,6 +213,22 @@ int main(int argc, char** argv) {
     if (!SnapshotDatabase("/data/misc/keystore/persistent.sqlite", "/tmp/recovery-keystore", AID_KEYSTORE) ||
         !SnapshotDatabase("/data/system/locksettings.db", "/tmp/recovery-locksettings", AID_ROOT) ||
         !StartKeystore()) return 1;
+    const int type = RecoveryCredentialType();
+    if (type == 3 || type == 4) {
+        android::base::unique_fd marker(open("/tmp/recovery-credential-type",
+                                             O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
+                                             0600));
+        if (marker < 0 || !android::base::WriteStringToFd(std::to_string(type), marker.get()))
+            return 1;
+        // Exit 2 asks recovery to collect a credential; it is not a mount error.
+        if (access("/tmp/recovery-credential", R_OK) != 0) return errno == ENOENT ? 2 : 1;
+        if (!SetProperty("ctl.start", "recovery-gatekeeper")) return 1;
+    } else if (type != -1) {
+        LOG(ERROR) << "Unsupported storage credential protector";
+        return 1;
+    } else {
+        unlink("/tmp/recovery-credential-type");
+    }
     const auto unlock_result = android::vold::ForkExecvp({argv[0], "--unlock"});
     SetProperty("ctl.stop", "keystore2-recovery");
     return unlock_result == 0 && IsStorageUnlocked() ? 0 : 1;

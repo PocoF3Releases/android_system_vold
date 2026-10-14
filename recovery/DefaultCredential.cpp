@@ -2,19 +2,26 @@
  * Copyright (C) 2026 The Android Open Source Project
  * SPDX-License-Identifier: Apache-2.0
  *
- * Mirrors the no-LSKF protector and SP v2/v3 derivation in Android 17's
+ * Mirrors the LSKF protector and SP v2/v3 derivation in Android 17's
  * SyntheticPasswordManager, SyntheticPasswordCrypto and SP800Derive.
  */
 #include "DefaultCredential.h"
 
+#include <aidl/android/security/authorization/IKeystoreAuthorization.h>
+#include <android/hardware/gatekeeper/1.0/IGatekeeper.h>
+#include <endian.h>
+#include <hardware/hw_auth_token.h>
 #include <inttypes.h>
 #include <sys/stat.h>
 
 #include <array>
+#include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <android-base/file.h>
@@ -180,28 +187,156 @@ std::vector<uint8_t> DeriveStorageSecret(uint8_t version, const std::vector<uint
                result.data(), &length) || length != result.size()) return {};
     return result;
 }
+
+struct PasswordData {
+    int type = -2;
+    uint8_t log_n = 0, log_r = 0, log_p = 0;
+    std::vector<uint8_t> salt, handle;
+};
+
+bool ParsePasswordData(const std::vector<uint8_t>& data, PasswordData* pwd) {
+    size_t offset = 0;
+    auto integer = [&](uint32_t* value) {
+        if (data.size() - offset < 4) return false;
+        *value = 0;
+        for (int i = 0; i < 4; ++i) *value = (*value << 8) | data[offset++];
+        return true;
+    };
+    uint32_t type, size;
+    if (!integer(&type) || data.size() - offset < 3) return false;
+    pwd->type = static_cast<int16_t>(type);  // Android 14 beta compatibility.
+    pwd->log_n = data[offset++];
+    pwd->log_r = data[offset++];
+    pwd->log_p = data[offset++];
+    if (!integer(&size) || size == 0 || size > 64 || size > data.size() - offset) return false;
+    pwd->salt.assign(data.begin() + offset, data.begin() + offset + size);
+    offset += size;
+    if (!integer(&size) || size == 0 || size > 4096 || size > data.size() - offset) return false;
+    pwd->handle.assign(data.begin() + offset, data.begin() + offset + size);
+    offset += size;
+    return data.size() - offset == 0 || data.size() - offset == 4;
+}
+
+bool VerifyGatekeeper(const PasswordData& pwd, const std::vector<uint8_t>& stretched) {
+    using android::hardware::gatekeeper::V1_0::GatekeeperStatusCode;
+    using android::hardware::gatekeeper::V1_0::IGatekeeper;
+    auto gatekeeper = IGatekeeper::tryGetService();
+    for (int i = 0; !gatekeeper && i < 50; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        gatekeeper = IGatekeeper::tryGetService();
+    }
+    if (!gatekeeper) {
+        LOG(ERROR) << "Recovery Gatekeeper is unavailable";
+        return false;
+    }
+    SensitiveBytes password{PersonalizedHash("user-gk-authentication", stretched)}, token;
+    bool verified = false;
+    int response_code = -1;
+    auto result =
+            gatekeeper->verify(100000, 0, pwd.handle, password.bytes, [&](const auto& response) {
+                response_code = static_cast<int>(response.code);
+                if (response.code == GatekeeperStatusCode::ERROR_RETRY_TIMEOUT) {
+                    LOG(ERROR) << "Credential verification throttled for " << response.timeout
+                               << " ms";
+                    return;
+                }
+                verified = response.code == GatekeeperStatusCode::STATUS_OK ||
+                           response.code == GatekeeperStatusCode::STATUS_REENROLL;
+                if (verified) token.bytes.assign(response.data.begin(), response.data.end());
+            });
+    // Do not reenroll, delete users, or persist credential state from recovery.
+    if (!result.isOk() || !verified || token.bytes.size() != sizeof(hw_auth_token_t)) {
+        LOG(ERROR) << "Gatekeeper verification failed (status " << response_code << ", transport "
+                   << result.isOk() << ", token size " << token.bytes.size() << ")";
+        return false;
+    }
+    hw_auth_token_t raw;
+    memcpy(&raw, token.bytes.data(), sizeof(raw));
+    km::HardwareAuthToken auth;
+    auth.challenge = raw.challenge;
+    auth.userId = raw.user_id;
+    auth.authenticatorId = raw.authenticator_id;
+    auth.authenticatorType =
+            static_cast<km::HardwareAuthenticatorType>(be32toh(raw.authenticator_type));
+    auth.timestamp.milliSeconds = be64toh(raw.timestamp);
+    auth.mac.assign(raw.hmac, raw.hmac + sizeof(raw.hmac));
+    OPENSSL_cleanse(&raw, sizeof(raw));
+    auto service = aidl::android::security::authorization::IKeystoreAuthorization::fromBinder(
+            ndk::SpAIBinder(AServiceManager_checkService("android.security.authorization")));
+    bool accepted = false;
+    if (service) {
+        const auto status = service->addAuthToken(auth);
+        accepted = status.isOk();
+        if (!accepted)
+            LOG(ERROR) << "Auth token delivery failed (exception " << status.getExceptionCode()
+                       << ", service " << status.getServiceSpecificError() << ")";
+    } else {
+        LOG(ERROR) << "Recovery authorization service unavailable";
+    }
+    OPENSSL_cleanse(auth.mac.data(), auth.mac.size());
+    return accepted;
+}
 }  // namespace
 
-bool RecoveryDefaultCredentialSecret(std::vector<uint8_t>* secret) {
+int RecoveryCredentialType() {
+    uint64_t protector;
+    if (!ReadProtector(&protector)) return -2;
+    const auto prefix =
+            android::base::StringPrintf("/data/system_de/0/spblob/%016" PRIx64, protector);
+    struct stat st{};
+    if (stat((prefix + ".weaver").c_str(), &st) == 0) return -2;
+    if (stat((prefix + ".pwd").c_str(), &st) != 0) return errno == ENOENT ? -1 : -2;
+    SensitiveBytes data;
+    PasswordData pwd;
+    return ReadState(prefix + ".pwd", &data.bytes) && ParsePasswordData(data.bytes, &pwd) ? pwd.type
+                                                                                          : -2;
+}
+
+bool RecoveryCredentialSecret(const std::vector<uint8_t>& credential,
+                              std::vector<uint8_t>* secret) {
     uint64_t protector = 0;
     if (!ReadProtector(&protector)) return false;
     const auto prefix = android::base::StringPrintf("/data/system_de/0/spblob/%016" PRIx64, protector);
-    // Do not attempt credentials or Weaver reads automatically. This path is
-    // for Android's current no-LSKF protectors; other protectors remain locked.
     struct stat st {};
-    if (stat((prefix + ".pwd").c_str(), &st) == 0 ||
-        stat((prefix + ".weaver").c_str(), &st) == 0) {
-        LOG(ERROR) << "Storage protector requires a credential/Weaver unlock";
+    if (stat((prefix + ".weaver").c_str(), &st) == 0) {
+        LOG(ERROR) << "Weaver protectors are not supported by this recovery path";
         return false;
     }
     SensitiveBytes secdiscardable, blob, protector_secret, intermediate, sp;
     if (!ReadState(prefix + ".secdis", &secdiscardable.bytes) ||
         secdiscardable.bytes.size() != 16 * 1024 || !ReadState(prefix + ".spblob", &blob.bytes) ||
-        blob.bytes.size() < 2 || (blob.bytes[0] != 2 && blob.bytes[0] != 3) || blob.bytes[1] != 0)
+        blob.bytes.size() < 2 || (blob.bytes[0] != 2 && blob.bytes[0] != 3) || blob.bytes[1] != 0) {
+        LOG(ERROR) << "Invalid synthetic password protector state";
         return false;
+    }
     protector_secret.bytes.resize(32, 0);
-    const std::string default_password = "default-password";
-    memcpy(protector_secret.bytes.data(), default_password.data(), default_password.size());
+    if (stat((prefix + ".pwd").c_str(), &st) == 0) {
+        SensitiveBytes serialized;
+        PasswordData pwd;
+        if (!ReadState(prefix + ".pwd", &serialized.bytes) ||
+            !ParsePasswordData(serialized.bytes, &pwd) || (pwd.type != 3 && pwd.type != 4) ||
+            credential.empty() || credential.size() > 64 || pwd.log_n > 20 || pwd.log_r > 8 ||
+            pwd.log_p > 8) {
+            LOG(ERROR) << "Invalid password derivation parameters";
+            return false;
+        }
+        const uint64_t n = 1ULL << pwd.log_n, r = 1ULL << pwd.log_r, p = 1ULL << pwd.log_p;
+        if (128 * n * r > 64 * 1024 * 1024 ||
+            EVP_PBE_scrypt(reinterpret_cast<const char*>(credential.data()), credential.size(),
+                           pwd.salt.data(), pwd.salt.size(), n, r, p, 64 * 1024 * 1024,
+                           protector_secret.bytes.data(), protector_secret.bytes.size()) != 1) {
+            LOG(ERROR) << "Password stretching failed";
+            return false;
+        }
+        if (!VerifyGatekeeper(pwd, protector_secret.bytes)) {
+            LOG(ERROR) << "Credential authentication failed";
+            return false;
+        }
+    } else {
+        if (errno != ENOENT || !credential.empty()) return false;
+        const std::string default_password = "default-password";
+        memcpy(protector_secret.bytes.data(), default_password.data(), default_password.size());
+    }
     SensitiveBytes sec_hash {PersonalizedHash("secdiscardable-transform", secdiscardable.bytes)};
     protector_secret.bytes.insert(protector_secret.bytes.end(), sec_hash.bytes.begin(), sec_hash.bytes.end());
     const std::vector<uint8_t> encrypted(blob.bytes.begin() + 2, blob.bytes.end());

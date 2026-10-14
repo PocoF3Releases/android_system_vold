@@ -308,6 +308,7 @@ cc_binary {
     defaults: ["vold_default_flags", "vold_default_libs", "keystore2_use_latest_aidl_ndk_shared"],
     srcs: ["recovery/RecoveryStorage.cpp", "recovery/DefaultCredential.cpp"],
     static_libs: ["libvold", "libsqlite_static_noicu"],
+    shared_libs: ["android.hardware.gatekeeper@1.0", "android.security.authorization-ndk"],
     header_libs: ["libvold_headers"],
     include_dirs: ["external/sqlite/dist"],
     cflags: ["-DRECOVERY_STORAGE"],
